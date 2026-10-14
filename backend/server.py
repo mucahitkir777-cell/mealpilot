@@ -29,7 +29,7 @@ lock = threading.Lock()
 rate_lock = threading.Lock()
 requests_per_ip = defaultdict(deque)
 all_requests = deque()  # Simple rolling usage cap to contain API costs
-MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
 
 class ProviderFailure(RuntimeError):
     def __init__(self, code, status):
@@ -377,7 +377,7 @@ def gemini_extract(video, caption):
         response=client.models.generate_content(
             model=MODEL,contents=contents,
             config=types.GenerateContentConfig(
-                temperature=0.1,response_mime_type="application/json",max_output_tokens=4000))
+                response_mime_type="application/json",max_output_tokens=5000))
         if not response.text: raise RuntimeError("Gemini hat keinen Rezepttext zurückgegeben")
         return parse_json_reply(response.text)
     except genai_errors.APIError as exc:
