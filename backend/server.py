@@ -25,6 +25,7 @@ MAX_BYTES = 42 * 1024 * 1024
 lock = threading.Lock()
 rate_lock = threading.Lock()
 requests_per_ip = defaultdict(deque)
+all_requests = deque()  # Simple rolling usage cap to contain API costs
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 PROMPT = """Extrahiere ein echtes KOCHREZEPT aus diesem TikTok-Video und seiner Beschreibung.
 Lies sowohl gesprochenen Text als auch Text-Einblendungen im Video sowie die Beschreibung.
@@ -196,10 +197,14 @@ def import_video():
     ip=request.headers.get("X-Forwarded-For",request.remote_addr or "unknown").split(",")[0].strip()
     now=time.monotonic()
     with rate_lock:
+        while all_requests and now-all_requests[0]>86400:all_requests.popleft()
+        if len(all_requests)>=30:
+            return jsonify({"error":"Das Tageskontingent von 30 Videoimporten ist erreicht. Bitte morgen erneut versuchen."}),429
         queue=requests_per_ip[ip]
         while queue and now-queue[0]>3600:queue.popleft()
         if len(queue)>=6:return jsonify({"error":"Maximal 6 Importe pro Stunde. Bitte später erneut versuchen."}),429
         queue.append(now)
+        all_requests.append(now)
     if not lock.acquire(blocking=False):
         return jsonify({"error":"Ein Rezept wird gerade analysiert. Bitte in einer Minute erneut versuchen."}),429
     try:
