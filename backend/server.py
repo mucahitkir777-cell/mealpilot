@@ -492,5 +492,28 @@ if os.environ.get("GEMINI_API_KEY"):
     threading.Thread(target=test_google_auth_once,daemon=True).start()
 
 
+
+# Temporary one-off integration check using the publicly shared failing link.
+# Remove after verifying the result. No video, recipe, or secret is logged.
+def _one_off_recipe_probe():
+    try:
+        time.sleep(3)
+        with app.test_client() as client:
+            response=client.post("/api/import",
+                  json={"url":"https://vm.tiktok.com/ZGdCPhXHw/"},
+                  headers={"Origin":FRONTEND})
+        data=response.get_json(silent=True) or {}
+        recipe=data.get("recipe") or {}
+        log.warning("One-off import check: status=%s method=%s count=%s video=%s provider_code=%s error_type=%s",
+                    response.status_code,data.get("extraction_method"),
+                    len(recipe.get("ingredients") or []),
+                    data.get("video_processed"),data.get("provider_code"),data.get("error_type"))
+    except Exception as error:
+        log.error("One-off import check failed: type=%s",type(error).__name__)
+
+if os.environ.get("GEMINI_API_KEY"):
+    threading.Thread(target=_one_off_recipe_probe,daemon=True).start()
+
+
 if __name__=="__main__":
     app.run(host="0.0.0.0",port=int(os.environ.get("PORT","10000")))
