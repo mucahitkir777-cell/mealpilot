@@ -16,7 +16,7 @@ import requests
 import yt_dlp
 from flask import Flask, jsonify, request
 from google import genai
-from google.genai import types
+from google.genai import types, errors as genai_errors
 
 app = Flask(__name__)
 app.json.ensure_ascii = False
@@ -30,6 +30,48 @@ rate_lock = threading.Lock()
 requests_per_ip = defaultdict(deque)
 all_requests = deque()  # Simple rolling usage cap to contain API costs
 MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+
+class ProviderFailure(RuntimeError):
+    def __init__(self, code, status):
+        self.code = int(code or 502)
+        self.status = str(status or "UNKNOWN")
+        super().__init__(self.status)
+
+
+def fail_google_api(error, stage):
+    code=getattr(error,"code",0)
+    status=getattr(error,"status","UNKNOWN")
+    log.error("Google Gemini stage=%s error_code=%s status=%s",stage,code,status)
+    return ProviderFailure(code,status)
+
+
+def provider_user_message(error):
+    if error.code in (401,403):
+        return "Gemini hat den API-Schlüssel nicht akzeptiert oder ihm fehlen Berechtigungen. Bitte Gemini-Zugang in Render prüfen."
+    if error.code==429:
+        return "Gemini meldet ein erschöpftes Kontingent oder eine zu hohe Anfragerate."
+    if error.code==404:
+        return "Das eingestellte Gemini-Modell ist mit diesem API-Zugang nicht verfügbar."
+    if error.code==400:
+        return "Die Gemini-API hat die Analyseanfrage abgelehnt (Fehler 400)."
+    return "Gemini konnte die Rezeptanalyse nicht durchführen (API-Fehler "+str(error.code)+")."
+
+
+def test_google_auth_once():
+    if not os.environ.get("GEMINI_API_KEY"):
+        log.warning("Gemini startup check: missing API key")
+        return
+    try:
+        client=genai.Client(api_key=os.environ["GEMINI_API_KEY"],
+                            http_options=types.HttpOptions(timeout=12000))
+        client.models.get(model=MODEL)
+        log.warning("Gemini startup check: model accessible")
+    except genai_errors.APIError as exc:
+        log.error("Gemini startup check: code=%s status=%s",getattr(exc,"code",None),getattr(exc,"status",None))
+    except Exception as exc:
+        log.error("Gemini startup check: failure_type=%s",type(exc).__name__)
+
+
 PROMPT = """Extrahiere ein echtes KOCHREZEPT aus diesem TikTok-Video und seiner Beschreibung.
 Lies sowohl gesprochenen Text als auch Text-Einblendungen im Video sowie die Beschreibung.
 Gib NUR ein valides JSON-Objekt, auf Deutsch, zurück:
@@ -338,6 +380,8 @@ def gemini_extract(video, caption):
                 temperature=0.1,response_mime_type="application/json",max_output_tokens=4000))
         if not response.text: raise RuntimeError("Gemini hat keinen Rezepttext zurückgegeben")
         return parse_json_reply(response.text)
+    except genai_errors.APIError as exc:
+        raise fail_google_api(exc, "video" if video else "caption") from None
     finally:
         if uploaded:
             try: client.files.delete(name=uploaded.name)
@@ -406,8 +450,10 @@ def import_video():
                             if parsed["is_recipe"] and parsed["ingredients"] and (is_complete(parsed) or not recipe):
                                 recipe=parsed
                                 used="description_ai"
-                        except Exception:
-                            log.warning("Gemini caption analysis failed; trying video")
+                        except ProviderFailure:
+                            raise
+                        except Exception as err:
+                            log.warning("Gemini caption analysis failed; error_type=%s",type(err).__name__)
                     if not is_complete(recipe):
                         with tempfile.TemporaryDirectory(prefix="mealpilot-tiktok-") as tmp:
                             try:
@@ -418,9 +464,11 @@ def import_video():
                                 if parsed["is_recipe"] and parsed["ingredients"]:
                                     recipe=parsed
                                     used="video"
+                            except ProviderFailure:
+                                raise
                             except Exception as e:
                                 log.warning("TikTok video could not be analyzed: %s",type(e).__name__)
-                                warnings.append("Das Video war nicht zugänglich. Überprüfe die aus der Beschreibung gewonnenen Daten.")
+                                warnings.append("Das Video konnte nicht analysiert werden. Prüfe die Rezeptbeschreibung.")
         if not recipe or not recipe["is_recipe"] or not recipe["ingredients"]:
             return jsonify({"error":"Keine Zutaten gefunden. Das TikTok-Video ist möglicherweise privat oder blockiert. Bitte versuche einen öffentlichen Rezeptlink."}),422
         if not is_complete(recipe):
@@ -430,11 +478,18 @@ def import_video():
         return jsonify({"recipe":recipe,"url":url,"author":meta["author"],
                         "thumbnail":meta["thumbnail"],"extraction_method":used,
                         "video_processed":video_processed,"warnings":warnings})
+    except ProviderFailure as error:
+        return jsonify({"error":provider_user_message(error),
+                        "error_type":"gemini_api","provider_code":error.code}), (429 if error.code==429 else 503)
     except Exception:
         log.exception("MealPilot import failed")
         return jsonify({"error":"Der Rezeptimport ist gerade fehlgeschlagen. Bitte später erneut versuchen."}),502
     finally:
         lock.release()
+
+
+if os.environ.get("GEMINI_API_KEY"):
+    threading.Thread(target=test_google_auth_once,daemon=True).start()
 
 
 if __name__=="__main__":
