@@ -1,4 +1,7 @@
 import json
+import ipaddress
+import socket
+from html import unescape
 import logging
 import os
 import re
@@ -91,12 +94,170 @@ def embed(url):
     try:
         r = requests.get("https://www.tiktok.com/oembed",
                          params={"url":url}, headers={"User-Agent":"Mozilla/5.0"},
-                         timeout=(4,12))
+                         timeout=(4,10))
         r.raise_for_status()
-        d = r.json()
-        return str(d.get("title") or "")[:7000], str(d.get("author_name") or "")[:100]
-    except requests.RequestException:
-        return "", ""
+        data=r.json()
+        return {"caption":str(data.get("title") or "")[:7000],
+                "author":str(data.get("author_name") or "")[:100],
+                "thumbnail":str(data.get("thumbnail_url") or "")[:1400]}
+    except (requests.RequestException,ValueError):
+        return {"caption":"","author":"","thumbnail":""}
+
+
+def fetch_video_metadata(url):
+    # Metadata alone is fetched here: no video download and no Gemini credits.
+    opts={"skip_download":True,"quiet":True,"no_warnings":True,"noplaylist":True,
+          "socket_timeout":10,"retries":0,"extractor_retries":0,
+          "http_headers":{"User-Agent":"Mozilla/5.0"}}
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info=ydl.extract_info(url,download=False) or {}
+        if info.get("_type")=="playlist":return {}
+        return {"caption":str(info.get("description") or "")[:10000],
+                "thumbnail":str(info.get("thumbnail") or "")[:1400],
+                "webpage":str(info.get("webpage_url") or "")[:1600]}
+
+
+ING_LINE=re.compile(
+    r"^\s*(?:[-•*]\s*)?(?P<qty>\d+(?:[.,]\d+)?(?:/\d+)?)\s*"
+    r"(?P<unit>kg|gramm|g|ml|liter|l|el|esslöffel|tl|teelöffel|stück|stk|dose|dosen|cups?|tassen?)\b"
+    r"\s*(?:von\s+)?(?P<name>.+)$",re.I)
+STEPS_RE=re.compile(r"(?:zubereitung|anleitung|zubereiten|so geht.s|directions|instructions|method)\s*[:\n-]*",re.I)
+TITLE_RE=re.compile(r"#\w+|https?://\S+",re.I)
+CATEGORIES=[("Dessert",["kuchen","brownie","cookie","dessert","muffin","tiramisu","pudding"]),
+            ("Frühstück",["porridge","overnight","frühstück","pancake","oatmeal","müsli"]),
+            ("Snack",["snack","riegel","chips"]),
+            ("Abendessen",["abendessen","dinner"]),
+            ("Mittagessen",["reis","pasta","nudel","curry","wrap","mealprep","meal prep","salat","kartoffel","mittagessen"])]
+
+
+def category_from_title(title):
+    t=title.lower()
+    for cat,words in CATEGORIES:
+        if any(w in t for w in words):return cat
+    return "Sonstiges"
+
+
+def parse_ingredient(text):
+    line=unescape(text).strip().strip(".,;:").replace("\u00a0"," ")
+    line=re.sub(r"^\s*(?:zutaten|ingredients)\s*:\s*","",line,flags=re.I)
+    m=ING_LINE.match(line)
+    if not m:return None
+    name=re.sub(r"\s+#\w+.*$","",m.group("name")).strip(" :-•")
+    if len(name)<2 or len(name)>130 or name.lower().startswith(("kcal","kalorien","minuten","protein")):
+        return None
+    try:
+        q=m.group("qty")
+        qty=float(q.split("/")[0])/float(q.split("/")[1]) if "/" in q else float(q.replace(",","."))
+    except (ValueError,ZeroDivisionError):return None
+    unit=m.group("unit").lower()
+    exact=unit in ("g","gramm","kg")
+    approximate=unit in ("ml","l","liter")
+    grams=qty*1000 if unit=="kg" else (qty*1000 if unit in ("l","liter") else qty) if (exact or approximate) else 0
+    return {"name":name,"grams":grams,"quantity_text":m.group("qty")+" "+m.group("unit"),
+            "uncertain":not exact or not grams}
+
+
+def recipe_from_caption(text):
+    if not text or len(text)<22:return None
+    # Preserve original line breaks: do not turn narrative numbers into fake ingredients.
+    chunks=re.split(r"[\n;]+",text.replace("•","\n•"))
+    title=""
+    ing=[]
+    for entry in chunks[:100]:
+        line=entry.strip()
+        if not line:continue
+        if not title and not ING_LINE.match(line) and not line.lower().startswith(("zutaten","ingredients","#")):
+            candidate=TITLE_RE.sub("",line).strip(" :-•")
+            if 4<len(candidate)<110:title=candidate
+        if not STEPS_RE.search(line):
+            item=parse_ingredient(line)
+            if item:ing.append(item)
+    if not ing:return None
+    title=title or "Rezept aus TikTok"
+    match=STEPS_RE.search(text)
+    steps=text[match.end():].split("#")[0].strip()[:7500] if match else ""
+    # Avoid fake complete recipes from hashtags or a mere sentence.
+    steps=steps if len(steps)>=20 else ""
+    raw={"title":title,"category":category_from_title(title),"servings":1,"steps":steps,
+         "ingredients":ing,"notes":"","confidence":"medium" if steps else "low",
+         "missing_information":([] if steps else ["Zubereitungsschritte fehlen"])+
+         (["Einige Zutatenmengen fehlen"] if any(x["uncertain"] for x in ing) else []),
+         "is_recipe":True}
+    return parse_recipe_raw(raw)
+
+
+def parse_recipe_raw(raw):
+    # Helper is delegated to the existing validated JSON sanitizer.
+    return parse_json_reply(json.dumps(raw,ensure_ascii=False))
+
+
+def is_complete(recipe):
+    if not recipe or not recipe["is_recipe"]:return False
+    ingredients=recipe["ingredients"]
+    return (len(ingredients)>=2 and bool(recipe["steps"]) and
+            sum(1 for i in ingredients if i["grams"]>0 and not i["uncertain"])/len(ingredients)>=0.75)
+
+
+def public_website(url):
+    try:
+        u=urlparse(url)
+        if u.scheme!="https" or not u.hostname or u.username or u.password or u.port is not None:return False
+        if u.hostname in TIKTOK_HOSTS or u.hostname.lower() in ("localhost",):return False
+        for item in socket.getaddrinfo(u.hostname,443,type=socket.SOCK_STREAM):
+            if not ipaddress.ip_address(item[4][0]).is_global:return False
+        return True
+    except Exception:return False
+
+
+def recipe_site_from_caption(caption):
+    # Only external public https links explicitly included in TikTok's caption.
+    candidates=re.findall(r"https://[^\s\]\)\>]+",caption)
+    for raw_url in candidates[:2]:
+        url=raw_url.rstrip(".,!;")
+        if not public_website(url):continue
+        try:
+            r=requests.get(url,timeout=(4,9),allow_redirects=False,
+                           headers={"User-Agent":"MealPilotRecipeImporter/1.0"},
+                           stream=True)
+            if r.status_code!=200 or "text/html" not in r.headers.get("Content-Type",""):continue
+            data=b""
+            for part in r.iter_content(16384):
+                data+=part
+                if len(data)>350000:break
+            html=data.decode("utf-8","ignore")
+            for match in re.findall(r'<script[^>]*type=["\']application/ld\+json["\'][^>]*>(.*?)</script>',
+                                    html,flags=re.I|re.S):
+                try:data=json.loads(unescape(match))
+                except ValueError:continue
+                nodes=data if isinstance(data,list) else [data]
+                for node in nodes:
+                    if not isinstance(node,dict):continue
+                    nodes2=node.get("@graph") if isinstance(node.get("@graph"),list) else [node]
+                    for doc in nodes2:
+                        if not isinstance(doc,dict):continue
+                        tp=doc.get("@type",[])
+                        if isinstance(tp,str):tp=[tp]
+                        if "Recipe" not in tp:continue
+                        lines=doc.get("recipeIngredient") or []
+                        ingredients=[v for x in lines if isinstance(x,str) if (v:=parse_ingredient(x))]
+                        directions=doc.get("recipeInstructions") or []
+                        if isinstance(directions,str):steps=directions
+                        else:steps="\n".join(str(x.get("text") or x.get("name") or "") if isinstance(x,dict) else str(x)
+                                             for x in directions)
+                        servings=doc.get("recipeYield") or 1
+                        if isinstance(servings,list):servings=servings[0] if servings else 1
+                        m=re.search(r"\d+",str(servings))
+                        raw={"title":str(doc.get("name") or "Rezept")[:140],
+                             "category":category_from_title(str(doc.get("name") or "")),
+                             "servings":int(m.group()) if m else 1,
+                             "ingredients":ingredients,"steps":steps[:7500],
+                             "is_recipe":True,"confidence":"high",
+                             "missing_information":[]}
+                        recipe=parse_recipe_raw(raw)
+                        if is_complete(recipe):return recipe,url
+        except (requests.RequestException,ValueError,TypeError):
+            continue
+    return None,None
 
 
 def load_public_video(url, directory):
@@ -191,47 +352,87 @@ def import_video():
     url=data.get("url","")
     if not isinstance(url,str) or not ok_tiktok_url(url):
         return jsonify({"error":"Bitte einen gültigen öffentlichen HTTPS-TikTok-Link verwenden."}),400
-    if not os.environ.get("GEMINI_API_KEY"):
-        return jsonify({"error":"Gemini ist noch nicht auf dem Server eingerichtet."}),503
-    # A single user's basic cost guard; browser origins can be forged by determined attackers.
+
     ip=request.headers.get("X-Forwarded-For",request.remote_addr or "unknown").split(",")[0].strip()
-    now=time.monotonic()
-    with rate_lock:
-        while all_requests and now-all_requests[0]>86400:all_requests.popleft()
-        if len(all_requests)>=30:
-            return jsonify({"error":"Das Tageskontingent von 30 Videoimporten ist erreicht. Bitte morgen erneut versuchen."}),429
-        queue=requests_per_ip[ip]
-        while queue and now-queue[0]>3600:queue.popleft()
-        if len(queue)>=6:return jsonify({"error":"Maximal 6 Importe pro Stunde. Bitte später erneut versuchen."}),429
-        queue.append(now)
-        all_requests.append(now)
     if not lock.acquire(blocking=False):
-        return jsonify({"error":"Ein Rezept wird gerade analysiert. Bitte in einer Minute erneut versuchen."}),429
+        return jsonify({"error":"Ein Rezept wird gerade importiert. Bitte gleich erneut versuchen."}),429
     try:
-        caption,author=embed(url)
+        meta=embed(url)
+        caption=meta["caption"]
+        try:
+            info=fetch_video_metadata(url)
+            if len(info.get("caption",""))>len(caption):caption=info["caption"]
+            if not meta["thumbnail"]:meta["thumbnail"]=info.get("thumbnail","")
+        except Exception as e:
+            log.info("TikTok video metadata inaccessible: %s",type(e).__name__)
+
         warnings=[]
-        with tempfile.TemporaryDirectory(prefix="mealpilot-tiktok-") as tmp:
-            video=None
-            try:
-                video,description=load_public_video(url,tmp)
-                if len(description)>len(caption):caption=description
-            except Exception as e:
-                log.warning("TikTok video access limited: %s",type(e).__name__)
-                warnings.append("Video nicht zugänglich: Nur die öffentlich verfügbare Beschreibung wurde analysiert.")
-            if not video and not caption:
-                return jsonify({"error":"Das TikTok-Video kann nicht gelesen werden. Bei privaten oder blockierten Videos brauchst du eine manuelle Beschreibung."}),422
-            recipe=gemini_extract(video,caption)
-            if not recipe["is_recipe"]:
-                return jsonify({"error":"Gemini konnte in diesem Inhalt kein Rezept erkennen."}),422
-            if not recipe["ingredients"]:
-                return jsonify({"error":"Im Video oder in der Beschreibung wurden keine klaren Zutaten erkannt."}),422
-            if recipe["confidence"]=="low":warnings.append("Die Rezeptdaten sind unsicher. Bitte sorgfältig prüfen.")
-            if any(i["uncertain"] for i in recipe["ingredients"]):
-                warnings.append("Mindestens eine Zutatenmenge fehlt oder ist unsicher und muss ergänzt werden.")
-            return jsonify({"recipe":recipe,"url":url,"author":author,"video_processed":bool(video),"warnings":warnings})
+        recipe=recipe_from_caption(caption)
+        used="caption"
+        video_processed=False
+        if not is_complete(recipe):
+            site_recipe,site_url=recipe_site_from_caption(caption)
+            if site_recipe:
+                recipe=site_recipe
+                used="website"
+
+        if not is_complete(recipe):
+            if not os.environ.get("GEMINI_API_KEY"):
+                if not recipe:
+                    return jsonify({"error":"Der Link enthält kein auslesbares Rezept. Gemini ist noch nicht eingerichtet."}),503
+                warnings.append("Kein Gemini-Schlüssel hinterlegt; das Rezept aus der Beschreibung ist unvollständig.")
+            else:
+                # AI requests use an independent global limit; text-only requests are much cheaper than video.
+                now=time.monotonic()
+                with rate_lock:
+                    while all_requests and now-all_requests[0]>86400:all_requests.popleft()
+                    queue=requests_per_ip[ip]
+                    while queue and now-queue[0]>3600:queue.popleft()
+                    if len(all_requests)>=30 or len(queue)>=6:
+                        if recipe:
+                            warnings.append("KI-Kontingent erreicht; es wurde nur die Beschreibung ausgewertet.")
+                        else:
+                            return jsonify({"error":"Das KI-Importkontingent ist erreicht. Bitte später erneut versuchen."}),429
+                        can_ai=False
+                    else:
+                        all_requests.append(now)
+                        queue.append(now)
+                        can_ai=True
+                if can_ai:
+                    # Try low-token text analysis first; do not download the video unless needed.
+                    if caption and len(caption)>=50:
+                        try:
+                            parsed=gemini_extract(None,caption)
+                            if parsed["is_recipe"] and parsed["ingredients"] and (is_complete(parsed) or not recipe):
+                                recipe=parsed
+                                used="description_ai"
+                        except Exception:
+                            log.warning("Gemini caption analysis failed; trying video")
+                    if not is_complete(recipe):
+                        with tempfile.TemporaryDirectory(prefix="mealpilot-tiktok-") as tmp:
+                            try:
+                                video,video_description=load_public_video(url,tmp)
+                                if video_description and len(video_description)>len(caption):caption=video_description
+                                parsed=gemini_extract(video,caption)
+                                video_processed=True
+                                if parsed["is_recipe"] and parsed["ingredients"]:
+                                    recipe=parsed
+                                    used="video"
+                            except Exception as e:
+                                log.warning("TikTok video could not be analyzed: %s",type(e).__name__)
+                                warnings.append("Das Video war nicht zugänglich. Überprüfe die aus der Beschreibung gewonnenen Daten.")
+        if not recipe or not recipe["is_recipe"] or not recipe["ingredients"]:
+            return jsonify({"error":"Keine Zutaten gefunden. Das TikTok-Video ist möglicherweise privat oder blockiert. Bitte versuche einen öffentlichen Rezeptlink."}),422
+        if not is_complete(recipe):
+            warnings.append("Dieses Rezept ist unvollständig; prüfe die Zutaten und Zubereitung.")
+        if any(i["uncertain"] for i in recipe["ingredients"]):
+            warnings.append("Einige Mengen fehlen oder sind ungenau.")
+        return jsonify({"recipe":recipe,"url":url,"author":meta["author"],
+                        "thumbnail":meta["thumbnail"],"extraction_method":used,
+                        "video_processed":video_processed,"warnings":warnings})
     except Exception:
-        log.exception("Gemini recipe import failed")
-        return jsonify({"error":"Die automatische KI-Auswertung ist gerade fehlgeschlagen. Bitte später erneut versuchen."}),502
+        log.exception("MealPilot import failed")
+        return jsonify({"error":"Der Rezeptimport ist gerade fehlgeschlagen. Bitte später erneut versuchen."}),502
     finally:
         lock.release()
 
