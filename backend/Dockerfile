@@ -4,4 +4,6 @@ WORKDIR /app
 COPY backend/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r /app/requirements.txt
 COPY backend/server.py /app/server.py
+COPY backend/test_import.py /app/test_import.py
+RUN python -m unittest discover -s /app -p 'test_*.py' -v
 CMD ["sh","-c","gunicorn --workers 1 --threads 2 --timeout 300 --bind 0.0.0.0:${PORT:-10000} server:app"]
